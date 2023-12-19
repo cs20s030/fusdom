@@ -42,7 +42,6 @@ from .utils import pad_to_multiple
 EXTRACTOR_MODE_CHOICES = ChoiceEnum(["default", "layer_norm"])
 MASKING_DISTRIBUTION_CHOICES = ChoiceEnum(["static", "uniform", "normal", "poisson"])
 LAYER_TYPE_CHOICES = ChoiceEnum(["transformer", "conformer"])
-#model_teacher = load_model_ensemble_and_task(['/nlsasfs/home/nltm-pilot/vasistal/Domain_Adaptation/conventional_ft/fairseq/examples/wav2vec/xlsr2_300m.pt'])[0][0]
 
 @dataclass
 class Wav2Vec2Config(FairseqDataclass):
@@ -62,12 +61,6 @@ class Wav2Vec2Config(FairseqDataclass):
         metadata={
             "help": "filename from which to load teacher checkpoint "
             "(default: <save-dir>/checkpoint_last.pt"
-        },
-    )
-    distill_weight: float = field(
-        default=1.0,
-        metadata={
-            "help": "Combine weight"
         },
     )
     distill: bool = field(
@@ -984,6 +977,16 @@ class Wav2Vec2Model(BaseFairseqModel):
             encoder_cls = ConformerEncoder
 
         self.encoder = encoder_cls(cfg)
+        self.fusion_layer = FusionLayer(
+            embedding_dim=cfg.encoder_embed_dim,
+            ffn_embedding_dim=cfg.encoder_ffn_embed_dim,
+            num_attention_heads=cfg.encoder_attention_heads,
+            dropout=cfg.dropout,
+            attention_dropout=cfg.attention_dropout,
+            activation_dropout=cfg.activation_dropout,
+            activation_fn=cfg.activation_fn,
+            layer_norm_first=cfg.layer_norm_first,
+            )
         self.layer_norm = LayerNorm(self.embed)
 
         self.target_glu = None
@@ -993,8 +996,6 @@ class Wav2Vec2Model(BaseFairseqModel):
             )
 
         self.final_proj = nn.Linear(cfg.encoder_embed_dim, final_dim)
-        self.criterion_mse = nn.MSELoss()
-        self.distill_weight = cfg.distill_weight
 
     def upgrade_state_dict_named(self, state_dict, name):
         super().upgrade_state_dict_named(state_dict, name)
@@ -1298,8 +1299,11 @@ class Wav2Vec2Model(BaseFairseqModel):
                 teacher_feature = self.teacher.extract_features(source, padding_mask)["x"]
         
 
-            
-            
+        print('student', x_stud.shape)
+        print('teacher', teacher_feature.shape)
+        x_fuse, _ = self.fusion_layer(x_stud.transpose(0, 1), teacher_feature.transpose(0, 1))
+        x = x_fuse
+        print('x-fuse',x.shape)
         
         if self.quantizer:
             if self.negatives_from_everywhere:
@@ -1373,8 +1377,6 @@ class Wav2Vec2Model(BaseFairseqModel):
         x = self.compute_preds(x, y, negs)
         student_layer = x_stud.permute(1,0,2) #[x[0].permute(1,0,2) for x in layer_results]
         teacher_layer = teacher_feature.permute(1,0,2) #[x[0].permute(1,0,2) for x in teacher_feature]
-        teacher_student_loss =  self.criterion_mse(student_layer, teacher_layer)
-
 
         result = {
             "x": x,
@@ -1382,8 +1384,6 @@ class Wav2Vec2Model(BaseFairseqModel):
             "features_pen": features_pen,
             "student_layer": student_layer,
             "teacher_layer": teacher_layer,
-            "distill_loss":  teacher_student_loss,
-            "distill_factor": self.distill_weight,
         }
 
         if prob_ppl is not None:
@@ -1910,4 +1910,116 @@ class TransformerSentenceEncoderLayer(nn.Module):
             x = residual + x
             x = self.final_layer_norm(x)
 
+        return x, (attn, layer_result)
+
+class FusionLayer(nn.Module):
+    """
+    Implements a Fusion Layer
+    """
+
+    def __init__(
+        self,
+        embedding_dim: float = 768,
+        ffn_embedding_dim: float = 3072,
+        num_attention_heads: int = 8,
+        dropout: float = 0.1,
+        attention_dropout: float = 0.1,
+        activation_dropout: float = 0.1,
+        activation_fn: str = "relu",
+        layer_norm_first: bool = False,
+    ) -> None:
+
+        super().__init__()
+        # Initialize parameters
+        self.embedding_dim = embedding_dim
+        self.dropout = dropout
+        self.activation_dropout = activation_dropout
+
+        # Initialize blocks
+        self.activation_fn = utils.get_activation_fn(activation_fn)
+        self.self_attn = MultiheadAttention(
+            self.embedding_dim,
+            num_attention_heads,
+            dropout=attention_dropout,
+            self_attention=True,
+        )
+
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(self.activation_dropout)
+        self.dropout3 = nn.Dropout(dropout)
+
+        self.layer_norm_first = layer_norm_first
+
+        # layer norm associated with the self attention layer
+        self.self_attn_layer_norm = LayerNorm(self.embedding_dim)
+        self.fc1 = nn.Linear(self.embedding_dim, ffn_embedding_dim)
+        self.fc2 = nn.Linear(ffn_embedding_dim, self.embedding_dim)
+
+        # layer norm associated with the position wise feed-forward NN
+        self.final_layer_norm = LayerNorm(self.embedding_dim)
+
+    def forward(
+        self,
+        x_learn: torch.Tensor,
+        x_static: torch.Tensor,
+        self_attn_mask: torch.Tensor = None,
+        self_attn_padding_mask: torch.Tensor = None,
+        need_weights: bool = False,
+        att_args=None,
+    ):
+        """
+        LayerNorm is applied either before or after the self-attention/ffn
+        modules similar to the original Transformer imlementation.
+        """
+        x = x_learn
+        residual = x
+
+        if self.layer_norm_first:
+            x = self.self_attn_layer_norm(x)
+            x, attn = self.self_attn(
+                query=x_static,
+                key=x,
+                value=x,
+                key_padding_mask=self_attn_padding_mask,
+                attn_mask=self_attn_mask,
+                need_weights=False,
+            )
+            x = self.dropout1(x)
+            x = residual + x
+
+            residual = x
+            x = self.final_layer_norm(x)
+            x = self.activation_fn(self.fc1(x))
+            x = self.dropout2(x)
+            x = self.fc2(x)
+
+            layer_result = x
+
+            x = self.dropout3(x)
+            x = residual + x
+        else:
+            x, attn = self.self_attn(
+                query=x_static,
+                key=x,
+                value=x,
+                key_padding_mask=self_attn_padding_mask,
+                need_weights=False,
+            )
+
+            x = self.dropout1(x)
+            x = residual + x
+
+            x = self.self_attn_layer_norm(x)
+
+            residual = x
+            x = self.activation_fn(self.fc1(x))
+            x = self.dropout2(x)
+            x = self.fc2(x)
+
+            layer_result = x
+
+            x = self.dropout3(x)
+            x = residual + x
+            x = self.final_layer_norm(x)
+        x = x.transpose(0, 1)
         return x, (attn, layer_result)
