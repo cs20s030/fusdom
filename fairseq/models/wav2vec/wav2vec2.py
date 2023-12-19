@@ -42,7 +42,7 @@ from .utils import pad_to_multiple
 EXTRACTOR_MODE_CHOICES = ChoiceEnum(["default", "layer_norm"])
 MASKING_DISTRIBUTION_CHOICES = ChoiceEnum(["static", "uniform", "normal", "poisson"])
 LAYER_TYPE_CHOICES = ChoiceEnum(["transformer", "conformer"])
-
+#model_teacher = load_model_ensemble_and_task(['/nlsasfs/home/nltm-pilot/vasistal/Domain_Adaptation/conventional_ft/fairseq/examples/wav2vec/xlsr2_300m.pt'])[0][0]
 
 @dataclass
 class Wav2Vec2Config(FairseqDataclass):
@@ -73,7 +73,7 @@ class Wav2Vec2Config(FairseqDataclass):
     distill: bool = field(
         default=False,
         metadata={
-            "help": "Want to do distillation ?"
+            "help": "want to do distillation ?"
         },
     )
     encoder_embed_dim: int = field(
@@ -1291,9 +1291,10 @@ class Wav2Vec2Model(BaseFairseqModel):
                 "layer_results": layer_results,
             }
 
+        #print(source.shape)
         if self.teacher:
             with torch.no_grad():
-                #Extract the features from the teacher model
+                #padding_mask = torch.BoolTensor(source.size(1)).fill_(False).unsqueeze(0)
                 teacher_feature = self.teacher.extract_features(source, padding_mask)["x"]
         
 
@@ -1381,7 +1382,8 @@ class Wav2Vec2Model(BaseFairseqModel):
             "features_pen": features_pen,
             "student_layer": student_layer,
             "teacher_layer": teacher_layer,
-            "distill_loss": self.distill_weight * teacher_student_loss,
+            "distill_loss":  teacher_student_loss,
+            "distill_factor": self.distill_weight,
         }
 
         if prob_ppl is not None:
